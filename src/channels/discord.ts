@@ -1,3 +1,7 @@
+import fs from 'fs';
+import https from 'https';
+import http from 'http';
+import path from 'path';
 import {
   Client,
   Events,
@@ -6,7 +10,7 @@ import {
   TextChannel,
 } from 'discord.js';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import { ASSISTANT_NAME, TRIGGER_PATTERN, GROUPS_DIR } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
@@ -16,6 +20,28 @@ import {
   OnInboundMessage,
   RegisteredGroup,
 } from '../types.js';
+
+/**
+ * Download a URL to a local file. Returns the file path, or null on failure.
+ */
+async function downloadFile(url: string, destPath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const protocol = url.startsWith('https') ? https : http;
+    const file = fs.createWriteStream(destPath);
+    const req = protocol.get(url, (res) => {
+      if (res.statusCode !== 200) {
+        file.close();
+        fs.unlink(destPath, () => {});
+        resolve(false);
+        return;
+      }
+      res.pipe(file);
+      file.on('finish', () => { file.close(); resolve(true); });
+    });
+    req.on('error', () => { file.close(); fs.unlink(destPath, () => {}); resolve(false); });
+    req.setTimeout(10000, () => { req.destroy(); resolve(false); });
+  });
+}
 
 export interface DiscordChannelOpts {
   onMessage: OnInboundMessage;
@@ -92,12 +118,28 @@ export class DiscordChannel implements Channel {
         }
       }
 
-      // Handle attachments — store placeholders so the agent knows something was sent
+      // Handle attachments — download images into the group folder so the agent can view them
       if (message.attachments.size > 0) {
-        const attachmentDescriptions = [...message.attachments.values()].map(
-          (att) => {
+        const group = this.opts.registeredGroups()[chatJid];
+        const attachmentDescriptions = await Promise.all(
+          [...message.attachments.values()].map(async (att) => {
             const contentType = att.contentType || '';
             if (contentType.startsWith('image/')) {
+              if (att.url && group?.folder) {
+                // Save image to groups/{folder}/images/ — visible in container at /workspace/group/images/
+                const imagesDir = path.join(GROUPS_DIR, group.folder, 'images');
+                fs.mkdirSync(imagesDir, { recursive: true });
+                const ext = path.extname(att.name || '') || '.png';
+                const filename = `${msgId}_${att.id}${ext}`;
+                const destPath = path.join(imagesDir, filename);
+                const containerPath = `/workspace/group/images/${filename}`;
+                const ok = await downloadFile(att.url, destPath);
+                if (ok) {
+                  logger.info({ destPath, containerPath }, 'Discord image downloaded');
+                  return `[Image: ${att.name || 'image'} — use Read tool on path: ${containerPath}]`;
+                }
+                logger.warn({ url: att.url }, 'Failed to download Discord image');
+              }
               return `[Image: ${att.name || 'image'}]`;
             } else if (contentType.startsWith('video/')) {
               return `[Video: ${att.name || 'video'}]`;
@@ -106,7 +148,7 @@ export class DiscordChannel implements Channel {
             } else {
               return `[File: ${att.name || 'file'}]`;
             }
-          },
+          }),
         );
         if (content) {
           content = `${content}\n${attachmentDescriptions.join('\n')}`;

@@ -4,6 +4,7 @@
  */
 import { ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -111,6 +112,20 @@ function buildVolumeMounts(
         readonly: true,
       });
     }
+  }
+
+  // GitHub CLI config (read-only) so agents can use `gh` commands
+  const ghConfigDir = path.join(
+    process.env.HOME || os.homedir(),
+    '.config',
+    'gh',
+  );
+  if (fs.existsSync(ghConfigDir)) {
+    mounts.push({
+      hostPath: ghConfigDir,
+      containerPath: '/home/node/.config/gh',
+      readonly: true,
+    });
   }
 
   // Per-group Claude sessions directory (isolated from other groups)

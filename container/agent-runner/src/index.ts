@@ -107,6 +107,22 @@ async function readStdin(): Promise<string> {
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 
+function loadUserMcpServers(): Record<string, { command: string; args: string[]; env?: Record<string, string> }> {
+  try {
+    const settingsPath = path.join(process.env.HOME || '/home/node', '.claude', 'settings.json');
+    if (!fs.existsSync(settingsPath)) return {};
+    const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+    if (settings.mcpServers && typeof settings.mcpServers === 'object') {
+      // Don't override the built-in nanoclaw server
+      const { nanoclaw: _, ...userServers } = settings.mcpServers;
+      return userServers;
+    }
+  } catch (err) {
+    console.error(`[agent-runner] Failed to load user MCP servers: ${err}`);
+  }
+  return {};
+}
+
 function writeOutput(output: ContainerOutput): void {
   console.log(OUTPUT_START_MARKER);
   console.log(JSON.stringify(output));
@@ -407,8 +423,7 @@ async function runQuery(
         'TeamCreate', 'TeamDelete', 'SendMessage',
         'TodoWrite', 'ToolSearch', 'Skill',
         'NotebookEdit',
-        'mcp__nanoclaw__*',
-        'mcp__ollama__*'
+        'mcp__*'
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -428,6 +443,7 @@ async function runQuery(
           command: 'node',
           args: [path.join(path.dirname(mcpServerPath), 'ollama-mcp-stdio.js')],
         },
+        ...loadUserMcpServers(),
       },
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
