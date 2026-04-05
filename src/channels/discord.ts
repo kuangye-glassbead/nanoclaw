@@ -36,10 +36,20 @@ async function downloadFile(url: string, destPath: string): Promise<boolean> {
         return;
       }
       res.pipe(file);
-      file.on('finish', () => { file.close(); resolve(true); });
+      file.on('finish', () => {
+        file.close();
+        resolve(true);
+      });
     });
-    req.on('error', () => { file.close(); fs.unlink(destPath, () => {}); resolve(false); });
-    req.setTimeout(10000, () => { req.destroy(); resolve(false); });
+    req.on('error', () => {
+      file.close();
+      fs.unlink(destPath, () => {});
+      resolve(false);
+    });
+    req.setTimeout(10000, () => {
+      req.destroy();
+      resolve(false);
+    });
   });
 }
 
@@ -135,10 +145,16 @@ export class DiscordChannel implements Channel {
                 const containerPath = `/workspace/group/images/${filename}`;
                 const ok = await downloadFile(att.url, destPath);
                 if (ok) {
-                  logger.info({ destPath, containerPath }, 'Discord image downloaded');
+                  logger.info(
+                    { destPath, containerPath },
+                    'Discord image downloaded',
+                  );
                   return `[Image: ${att.name || 'image'} — use Read tool on path: ${containerPath}]`;
                 }
-                logger.warn({ url: att.url }, 'Failed to download Discord image');
+                logger.warn(
+                  { url: att.url },
+                  'Failed to download Discord image',
+                );
               }
               return `[Image: ${att.name || 'image'}]`;
             } else if (contentType.startsWith('video/')) {

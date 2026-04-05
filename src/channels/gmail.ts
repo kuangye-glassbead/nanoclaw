@@ -5,7 +5,6 @@ import path from 'path';
 import { google, gmail_v1 } from 'googleapis';
 import { OAuth2Client } from 'google-auth-library';
 
-// isMain flag is used instead of MAIN_GROUP_FOLDER constant
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
@@ -26,20 +25,98 @@ interface ThreadMeta {
   senderName: string;
   subject: string;
   messageId: string; // RFC 2822 Message-ID for In-Reply-To
+  accountName: string; // which account owns this thread
+}
+
+/** Per-account Gmail poller */
+class GmailAccount {
+  readonly accountName: string;
+  readonly gmail: gmail_v1.Gmail;
+  readonly oauth2Client: OAuth2Client;
+  userEmail = '';
+
+  private pollIntervalMs: number;
+  private pollTimer: ReturnType<typeof setTimeout> | null = null;
+  private processedIds = new Set<string>();
+  private consecutiveErrors = 0;
+
+  constructor(
+    accountName: string,
+    oauth2Client: OAuth2Client,
+    gmail: gmail_v1.Gmail,
+    pollIntervalMs: number,
+  ) {
+    this.accountName = accountName;
+    this.oauth2Client = oauth2Client;
+    this.gmail = gmail;
+    this.pollIntervalMs = pollIntervalMs;
+  }
+
+  startPolling(onPoll: () => Promise<void>): void {
+    const schedulePoll = () => {
+      const backoffMs =
+        this.consecutiveErrors > 0
+          ? Math.min(
+              this.pollIntervalMs * Math.pow(2, this.consecutiveErrors),
+              30 * 60 * 1000,
+            )
+          : this.pollIntervalMs;
+      this.pollTimer = setTimeout(() => {
+        onPoll()
+          .catch((err) =>
+            logger.error(
+              { err, account: this.accountName },
+              'Gmail poll error',
+            ),
+          )
+          .finally(() => {
+            if (this.gmail) schedulePoll();
+          });
+      }, backoffMs);
+    };
+    schedulePoll();
+  }
+
+  recordError(): void {
+    this.consecutiveErrors++;
+  }
+
+  clearErrors(): void {
+    this.consecutiveErrors = 0;
+  }
+
+  get currentConsecutiveErrors(): number {
+    return this.consecutiveErrors;
+  }
+
+  addProcessedId(id: string): boolean {
+    if (this.processedIds.has(id)) return false;
+    this.processedIds.add(id);
+    return true;
+  }
+
+  trimProcessedIds(): void {
+    if (this.processedIds.size > 5000) {
+      const ids = [...this.processedIds];
+      this.processedIds = new Set(ids.slice(ids.length - 2500));
+    }
+  }
+
+  stop(): void {
+    if (this.pollTimer) {
+      clearTimeout(this.pollTimer);
+      this.pollTimer = null;
+    }
+  }
 }
 
 export class GmailChannel implements Channel {
   name = 'gmail';
 
-  private oauth2Client: OAuth2Client | null = null;
-  private gmail: gmail_v1.Gmail | null = null;
+  private accounts: GmailAccount[] = [];
   private opts: GmailChannelOpts;
   private pollIntervalMs: number;
-  private pollTimer: ReturnType<typeof setTimeout> | null = null;
-  private processedIds = new Set<string>();
   private threadMeta = new Map<string, ThreadMeta>();
-  private consecutiveErrors = 0;
-  private userEmail = '';
 
   constructor(opts: GmailChannelOpts, pollIntervalMs = 60000) {
     this.opts = opts;
@@ -49,76 +126,113 @@ export class GmailChannel implements Channel {
   async connect(): Promise<void> {
     const credDir = path.join(os.homedir(), '.gmail-mcp');
     const keysPath = path.join(credDir, 'gcp-oauth.keys.json');
-    const tokensPath = path.join(credDir, 'credentials.json');
 
-    if (!fs.existsSync(keysPath) || !fs.existsSync(tokensPath)) {
+    if (!fs.existsSync(keysPath)) {
       logger.warn(
-        'Gmail credentials not found in ~/.gmail-mcp/. Skipping Gmail channel. Run /add-gmail to set up.',
+        'Gmail OAuth keys not found in ~/.gmail-mcp/gcp-oauth.keys.json. Skipping Gmail channel.',
       );
       return;
     }
 
     const keys = JSON.parse(fs.readFileSync(keysPath, 'utf-8'));
-    const tokens = JSON.parse(fs.readFileSync(tokensPath, 'utf-8'));
-
     const clientConfig = keys.installed || keys.web || keys;
     const { client_id, client_secret, redirect_uris } = clientConfig;
-    this.oauth2Client = new google.auth.OAuth2(
-      client_id,
-      client_secret,
-      redirect_uris?.[0],
-    );
-    this.oauth2Client.setCredentials(tokens);
 
-    // Persist refreshed tokens
-    this.oauth2Client.on('tokens', (newTokens) => {
-      try {
-        const current = JSON.parse(fs.readFileSync(tokensPath, 'utf-8'));
-        Object.assign(current, newTokens);
-        fs.writeFileSync(tokensPath, JSON.stringify(current, null, 2));
-        logger.debug('Gmail OAuth tokens refreshed');
-      } catch (err) {
-        logger.warn({ err }, 'Failed to persist refreshed Gmail tokens');
-      }
-    });
+    // Discover accounts: subdirectories with credentials.json, or root credentials.json
+    const accountDirs = this.discoverAccounts(credDir);
 
-    this.gmail = google.gmail({ version: 'v1', auth: this.oauth2Client });
-
-    // Verify connection
-    const profile = await this.gmail.users.getProfile({ userId: 'me' });
-    this.userEmail = profile.data.emailAddress || '';
-    logger.info({ email: this.userEmail }, 'Gmail channel connected');
-
-    // Start polling with error backoff
-    const schedulePoll = () => {
-      const backoffMs = this.consecutiveErrors > 0
-        ? Math.min(this.pollIntervalMs * Math.pow(2, this.consecutiveErrors), 30 * 60 * 1000)
-        : this.pollIntervalMs;
-      this.pollTimer = setTimeout(() => {
-        this.pollForMessages()
-          .catch((err) => logger.error({ err }, 'Gmail poll error'))
-          .finally(() => {
-            if (this.gmail) schedulePoll();
-          });
-      }, backoffMs);
-    };
-
-    // Initial poll
-    await this.pollForMessages();
-    schedulePoll();
-  }
-
-  async sendMessage(jid: string, text: string): Promise<void> {
-    if (!this.gmail) {
-      logger.warn('Gmail not initialized');
+    if (accountDirs.length === 0) {
+      logger.warn(
+        'No Gmail credentials.json found. Skipping Gmail channel. Run /add-gmail to set up.',
+      );
       return;
     }
 
+    for (const { name: accountName, tokensPath } of accountDirs) {
+      try {
+        const tokens = JSON.parse(fs.readFileSync(tokensPath, 'utf-8'));
+
+        const oauth2Client = new google.auth.OAuth2(
+          client_id,
+          client_secret,
+          redirect_uris?.[0],
+        );
+        oauth2Client.setCredentials(tokens);
+
+        // Persist refreshed tokens
+        const tokenFile = tokensPath;
+        oauth2Client.on('tokens', (newTokens) => {
+          try {
+            const current = JSON.parse(fs.readFileSync(tokenFile, 'utf-8'));
+            Object.assign(current, newTokens);
+            fs.writeFileSync(tokenFile, JSON.stringify(current, null, 2));
+            logger.debug(
+              { account: accountName },
+              'Gmail OAuth tokens refreshed',
+            );
+          } catch (err) {
+            logger.warn(
+              { err, account: accountName },
+              'Failed to persist refreshed Gmail tokens',
+            );
+          }
+        });
+
+        const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+        const profile = await gmail.users.getProfile({ userId: 'me' });
+
+        const account = new GmailAccount(
+          accountName,
+          oauth2Client,
+          gmail,
+          this.pollIntervalMs,
+        );
+        account.userEmail = profile.data.emailAddress || '';
+
+        logger.info(
+          { account: accountName, email: account.userEmail },
+          'Gmail account connected',
+        );
+
+        this.accounts.push(account);
+
+        // Initial poll + start polling loop
+        await this.pollAccount(account);
+        account.startPolling(() => this.pollAccount(account));
+      } catch (err) {
+        logger.error(
+          { err, account: accountName },
+          'Failed to connect Gmail account',
+        );
+      }
+    }
+
+    if (this.accounts.length > 0) {
+      logger.info(
+        { count: this.accounts.length },
+        'Gmail channel connected with %d account(s)',
+        this.accounts.length,
+      );
+    }
+  }
+
+  async sendMessage(jid: string, text: string): Promise<void> {
     const threadId = jid.replace(/^gmail:/, '');
     const meta = this.threadMeta.get(threadId);
 
     if (!meta) {
       logger.warn({ jid }, 'No thread metadata for reply, cannot send');
+      return;
+    }
+
+    const account = this.accounts.find(
+      (a) => a.accountName === meta.accountName,
+    );
+    if (!account) {
+      logger.warn(
+        { jid, account: meta.accountName },
+        'Account not found for reply',
+      );
       return;
     }
 
@@ -128,7 +242,7 @@ export class GmailChannel implements Channel {
 
     const headers = [
       `To: ${meta.sender}`,
-      `From: ${this.userEmail}`,
+      `From: ${account.userEmail}`,
       `Subject: ${subject}`,
       `In-Reply-To: ${meta.messageId}`,
       `References: ${meta.messageId}`,
@@ -144,21 +258,24 @@ export class GmailChannel implements Channel {
       .replace(/=+$/, '');
 
     try {
-      await this.gmail.users.messages.send({
+      await account.gmail.users.messages.send({
         userId: 'me',
         requestBody: {
           raw: encodedMessage,
           threadId,
         },
       });
-      logger.info({ to: meta.sender, threadId }, 'Gmail reply sent');
+      logger.info(
+        { to: meta.sender, threadId, account: account.accountName },
+        'Gmail reply sent',
+      );
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Gmail reply');
     }
   }
 
   isConnected(): boolean {
-    return this.gmail !== null;
+    return this.accounts.length > 0;
   }
 
   ownsJid(jid: string): boolean {
@@ -166,27 +283,53 @@ export class GmailChannel implements Channel {
   }
 
   async disconnect(): Promise<void> {
-    if (this.pollTimer) {
-      clearTimeout(this.pollTimer);
-      this.pollTimer = null;
+    for (const account of this.accounts) {
+      account.stop();
     }
-    this.gmail = null;
-    this.oauth2Client = null;
+    this.accounts = [];
     logger.info('Gmail channel stopped');
   }
 
   // --- Private ---
 
+  private discoverAccounts(
+    credDir: string,
+  ): Array<{ name: string; tokensPath: string }> {
+    const accounts: Array<{ name: string; tokensPath: string }> = [];
+
+    // Check subdirectories for multi-account setup
+    try {
+      const entries = fs.readdirSync(credDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const tokensPath = path.join(credDir, entry.name, 'credentials.json');
+        if (fs.existsSync(tokensPath)) {
+          accounts.push({ name: entry.name, tokensPath });
+        }
+      }
+    } catch {
+      // Directory read failed, fall through to legacy check
+    }
+
+    // Fall back to legacy single-account setup (credentials.json in root)
+    if (accounts.length === 0) {
+      const legacyTokens = path.join(credDir, 'credentials.json');
+      if (fs.existsSync(legacyTokens)) {
+        accounts.push({ name: 'default', tokensPath: legacyTokens });
+      }
+    }
+
+    return accounts;
+  }
+
   private buildQuery(): string {
     return 'is:unread category:primary';
   }
 
-  private async pollForMessages(): Promise<void> {
-    if (!this.gmail) return;
-
+  private async pollAccount(account: GmailAccount): Promise<void> {
     try {
       const query = this.buildQuery();
-      const res = await this.gmail.users.messages.list({
+      const res = await account.gmail.users.messages.list({
         userId: 'me',
         q: query,
         maxResults: 10,
@@ -195,30 +338,30 @@ export class GmailChannel implements Channel {
       const messages = res.data.messages || [];
 
       for (const stub of messages) {
-        if (!stub.id || this.processedIds.has(stub.id)) continue;
-        this.processedIds.add(stub.id);
-
-        await this.processMessage(stub.id);
+        if (!stub.id || !account.addProcessedId(stub.id)) continue;
+        await this.processMessage(account, stub.id);
       }
 
-      // Cap processed ID set to prevent unbounded growth
-      if (this.processedIds.size > 5000) {
-        const ids = [...this.processedIds];
-        this.processedIds = new Set(ids.slice(ids.length - 2500));
-      }
-
-      this.consecutiveErrors = 0;
+      account.trimProcessedIds();
+      account.clearErrors();
     } catch (err) {
-      this.consecutiveErrors++;
-      const backoffMs = Math.min(this.pollIntervalMs * Math.pow(2, this.consecutiveErrors), 30 * 60 * 1000);
-      logger.error({ err, consecutiveErrors: this.consecutiveErrors, nextPollMs: backoffMs }, 'Gmail poll failed');
+      account.recordError();
+      logger.error(
+        {
+          err,
+          account: account.accountName,
+          consecutiveErrors: account.currentConsecutiveErrors,
+        },
+        'Gmail poll failed',
+      );
     }
   }
 
-  private async processMessage(messageId: string): Promise<void> {
-    if (!this.gmail) return;
-
-    const msg = await this.gmail.users.messages.get({
+  private async processMessage(
+    account: GmailAccount,
+    messageId: string,
+  ): Promise<void> {
+    const msg = await account.gmail.users.messages.get({
       userId: 'me',
       id: messageId,
       format: 'full',
@@ -243,7 +386,7 @@ export class GmailChannel implements Channel {
     const senderEmail = senderMatch ? senderMatch[2] : from;
 
     // Skip emails from self (our own replies)
-    if (senderEmail === this.userEmail) return;
+    if (senderEmail === account.userEmail) return;
 
     // Extract body text
     const body = this.extractTextBody(msg.data.payload);
@@ -261,6 +404,7 @@ export class GmailChannel implements Channel {
       senderName,
       subject,
       messageId: rfc2822MessageId,
+      accountName: account.accountName,
     });
 
     // Store chat metadata for group discovery
@@ -268,9 +412,7 @@ export class GmailChannel implements Channel {
 
     // Find the main group to deliver the email notification
     const groups = this.opts.registeredGroups();
-    const mainEntry = Object.entries(groups).find(
-      ([, g]) => g.isMain === true,
-    );
+    const mainEntry = Object.entries(groups).find(([, g]) => g.isMain === true);
 
     if (!mainEntry) {
       logger.debug(
@@ -281,7 +423,9 @@ export class GmailChannel implements Channel {
     }
 
     const mainJid = mainEntry[0];
-    const content = `[Email from ${senderName} <${senderEmail}>]\nSubject: ${subject}\n\n${body}`;
+    const accountLabel =
+      this.accounts.length > 1 ? ` (${account.userEmail})` : '';
+    const content = `[Email from ${senderName} <${senderEmail}>${accountLabel}]\nSubject: ${subject}\n\n${body}`;
 
     this.opts.onMessage(mainJid, {
       id: messageId,
@@ -295,7 +439,7 @@ export class GmailChannel implements Channel {
 
     // Mark as read
     try {
-      await this.gmail.users.messages.modify({
+      await account.gmail.users.messages.modify({
         userId: 'me',
         id: messageId,
         requestBody: { removeLabelIds: ['UNREAD'] },
@@ -305,7 +449,7 @@ export class GmailChannel implements Channel {
     }
 
     logger.info(
-      { mainJid, from: senderName, subject },
+      { mainJid, from: senderName, subject, account: account.accountName },
       'Gmail email delivered to main group',
     );
   }
@@ -341,11 +485,8 @@ export class GmailChannel implements Channel {
 
 registerChannel('gmail', (opts: ChannelOpts) => {
   const credDir = path.join(os.homedir(), '.gmail-mcp');
-  if (
-    !fs.existsSync(path.join(credDir, 'gcp-oauth.keys.json')) ||
-    !fs.existsSync(path.join(credDir, 'credentials.json'))
-  ) {
-    logger.warn('Gmail: credentials not found in ~/.gmail-mcp/');
+  if (!fs.existsSync(path.join(credDir, 'gcp-oauth.keys.json'))) {
+    logger.warn('Gmail: OAuth keys not found in ~/.gmail-mcp/');
     return null;
   }
   return new GmailChannel(opts);
